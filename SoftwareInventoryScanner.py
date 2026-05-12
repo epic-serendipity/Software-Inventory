@@ -1270,6 +1270,9 @@ class DatabaseManager:
                 display_name TEXT,
                 display_version TEXT,
                 publisher TEXT,
+                display_name_norm TEXT,
+                display_version_norm TEXT,
+                publisher_norm TEXT,
                 install_date TEXT,
                 uninstall_string TEXT,
                 install_location TEXT,
@@ -1306,21 +1309,29 @@ class DatabaseManager:
             CREATE INDEX IF NOT EXISTS idx_software_scan_computer
                 ON software(scan_id, computer_id);
 
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_software_computer_identity_norm
+                ON software(
+                    computer_id,
+                    display_name_norm,
+                    display_version_norm,
+                    publisher_norm
+                );
+
             CREATE INDEX IF NOT EXISTS idx_software_lookup_exact_norm
                 ON software(
                     scan_id,
                     computer_id,
-                    LOWER(TRIM(display_name)),
-                    LOWER(TRIM(display_version)),
-                    LOWER(TRIM(publisher))
+                    display_name_norm,
+                    display_version_norm,
+                    publisher_norm
                 );
 
             CREATE INDEX IF NOT EXISTS idx_software_lookup_group_norm
                 ON software(
                     scan_id,
                     computer_id,
-                    LOWER(TRIM(display_name)),
-                    LOWER(TRIM(publisher))
+                    display_name_norm,
+                    publisher_norm
                 );
             """)
             self.connection.commit()
@@ -1330,9 +1341,63 @@ class DatabaseManager:
             if "ip_sort_key" not in computer_columns:
                 cursor.execute("ALTER TABLE computers ADD COLUMN ip_sort_key TEXT")
 
+            cursor.execute("PRAGMA table_info(software)")
+            software_columns = {row[1] for row in cursor.fetchall()}
+            if "display_name_norm" not in software_columns:
+                cursor.execute(
+                    "ALTER TABLE software ADD COLUMN display_name_norm TEXT"
+                )
+            if "display_version_norm" not in software_columns:
+                cursor.execute(
+                    "ALTER TABLE software ADD COLUMN display_version_norm TEXT"
+                )
+            if "publisher_norm" not in software_columns:
+                cursor.execute(
+                    "ALTER TABLE software ADD COLUMN publisher_norm TEXT"
+                )
+
+            cursor.execute("""
+                UPDATE software
+                SET
+                    display_name_norm = LOWER(TRIM(COALESCE(display_name, ''))),
+                    display_version_norm = LOWER(TRIM(COALESCE(display_version, ''))),
+                    publisher_norm = LOWER(TRIM(COALESCE(publisher, '')))
+                WHERE display_name_norm IS NULL
+                    OR display_version_norm IS NULL
+                    OR publisher_norm IS NULL
+            """)
+
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_computers_scan_ip_sort
                     ON computers(scan_id, ip_sort_key, hostname)
+            """)
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_software_computer_identity_norm
+                    ON software(
+                        computer_id,
+                        display_name_norm,
+                        display_version_norm,
+                        publisher_norm
+                    )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_software_lookup_exact_norm
+                    ON software(
+                        scan_id,
+                        computer_id,
+                        display_name_norm,
+                        display_version_norm,
+                        publisher_norm
+                    )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_software_lookup_group_norm
+                    ON software(
+                        scan_id,
+                        computer_id,
+                        display_name_norm,
+                        publisher_norm
+                    )
             """)
             self.connection.commit()
             AppLogger.log_message("info", "Database initialized.")
@@ -1620,30 +1685,26 @@ class DatabaseManager:
         """
         try:
             cursor = self.connection.cursor()
-            seen_keys = set()
             rows = []
 
             for record in software_records:
                 if not record.is_valid():
                     continue
 
-                key = (
-                    computer_id,
-                    self._normalize_identity(record.display_name),
-                    self._normalize_identity(record.display_version),
-                    self._normalize_identity(record.publisher),
+                display_name_norm = self._normalize_identity(record.display_name)
+                display_version_norm = self._normalize_identity(
+                    record.display_version
                 )
-
-                if key in seen_keys:
-                    continue
-
-                seen_keys.add(key)
+                publisher_norm = self._normalize_identity(record.publisher)
                 rows.append((
                     record.scan_id,
                     computer_id,
                     record.display_name,
                     record.display_version,
                     record.publisher,
+                    display_name_norm,
+                    display_version_norm,
+                    publisher_norm,
                     record.install_date,
                     record.uninstall_string,
                     record.install_location,
@@ -1655,12 +1716,13 @@ class DatabaseManager:
                 ))
 
             cursor.executemany("""
-                INSERT INTO software (
+                INSERT OR IGNORE INTO software (
                     scan_id, computer_id, display_name, display_version,
-                    publisher, install_date, uninstall_string,
+                    publisher, display_name_norm, display_version_norm,
+                    publisher_norm, install_date, uninstall_string,
                     install_location, estimated_size, registry_key,
                     registry_hive, architecture, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, rows)
 
             self.connection.commit()
