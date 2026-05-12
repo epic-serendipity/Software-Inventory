@@ -7126,16 +7126,16 @@ class LogsPanel(ttk.Frame):
         Args:
             text: Log message.
         """
-        lowered = text.lower()
+        upper_text = text.upper()
 
         tag = None
-        if "error" in lowered or "critical" in lowered:
+        if "] CRITICAL [" in upper_text or "] ERROR [" in upper_text:
             tag = "error"
-        elif "warning" in lowered:
+        elif "] WARNING [" in upper_text:
             tag = "warning"
-        elif "info" in lowered:
+        elif "] INFO [" in upper_text:
             tag = "info"
-        elif "debug" in lowered:
+        elif "] DEBUG [" in upper_text:
             tag = "debug"
 
         if tag:
