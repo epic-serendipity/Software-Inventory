@@ -5355,13 +5355,13 @@ class InstalledSoftwarePanel(ttk.Frame):
         if not self.detail_callback:
             return
 
-        properties = {
-            "Software": values[0] if len(values) > 0 else "",
-            "Version": values[1] if len(values) > 1 else "",
-            "Publisher": values[2] if len(values) > 2 else "",
-            "Install Date": values[3] if len(values) > 3 else "",
-        }
-        self.detail_callback(properties)
+        selected = self.table.tree.selection()
+        if not selected:
+            return
+
+        selected_row = self.table.rows_by_item.get(selected[0], {})
+        software_id = selected_row.get("_SoftwareId", "")
+        self.detail_callback(software_id)
 
 # ------------------ Computer Inventory Panel ------------------ #
 class ComputerInventoryPanel(ttk.Frame):
@@ -5653,6 +5653,16 @@ class ComputerBreakoutPanel(ttk.Frame):
         self._selected_is_already_grouped = bool(
             self.current_software_key.get("grouped_versions")
         )
+
+        # Always reset Group Versions for non-grouped software selections so
+        # each Computer Breakout view starts unchecked unless the source row is
+        # already grouped by the Software Summary mode.
+        if not self._selected_is_already_grouped and self.group_versions_var.get():
+            self._suspend_traces = True
+            try:
+                self.group_versions_var.set(False)
+            finally:
+                self._suspend_traces = False
 
         self._configure_group_versions_visibility()
         self.all_rows = [self._normalize_row(row) for row in rows]
@@ -6962,7 +6972,7 @@ class ResultsNotebook(ttk.Frame):
             self.current_scan_id,
             safe_computer_id,
         )
-        self.installed_software_panel.populate_software(rows)
+        self.installed_software_panel.populate_installed_software(rows)
         self._select_tab("Installed Software")
 
     def show_detail_properties(
@@ -6995,7 +7005,7 @@ class ResultsNotebook(ttk.Frame):
                 safe_record_id
             )
 
-        self.details_panel.populate_details(properties)
+        self.details_panel.show_detail_properties(properties, detail_type=detail_type.title())
         self._select_tab("Details")
 
     def append_live_feed(self, text: str) -> None:
@@ -7005,7 +7015,7 @@ class ResultsNotebook(ttk.Frame):
         Args:
             text: Feed text.
         """
-        self.live_feed_panel.append_message(text)
+        self.live_feed_panel.append_live_feed(text)
 
     def append_log(self, text: str) -> None:
         """
@@ -7014,7 +7024,7 @@ class ResultsNotebook(ttk.Frame):
         Args:
             text: Log text.
         """
-        self.logs_panel.append_message(text)
+        self.logs_panel.append_log(text)
 
     def process_log_queue(self) -> None:
         """Drain queued log messages into Logs tab."""
@@ -7072,7 +7082,7 @@ class ResultsNotebook(ttk.Frame):
         )
         self.details_panel = DetailsPanel(self.notebook)
         self.live_feed_panel = LiveFeedPanel(self.notebook)
-        self.logs_panel = LogsPanel(self.notebook)
+        self.logs_panel = LogsPanel(self.notebook, self.log_queue)
 
         self._tab_widgets = {
             "Dashboard": self.dashboard_panel,
