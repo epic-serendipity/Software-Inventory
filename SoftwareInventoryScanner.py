@@ -6834,6 +6834,23 @@ class ResultsNotebook(ttk.Frame):
         computers = self.database_manager.get_all_computers_with_counts(scan_id)
         self.computer_inventory_panel.populate_computers(computers)
 
+    def populate_software_summary(
+        self,
+        rows: Sequence[Any],
+        successful_inventory_count: int = 0,
+    ) -> None:
+        """
+        Populate Software Summary tab.
+
+        Args:
+            rows: Software summary rows.
+            successful_inventory_count: Number of successful inventory targets.
+        """
+        self.software_summary_panel.populate(
+            rows,
+            successful_inventory_count=successful_inventory_count,
+        )
+
     def populate_computers(self, rows: Sequence[Any]) -> None:
         """
         Populate main Computers tab.
