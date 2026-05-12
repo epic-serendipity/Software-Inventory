@@ -38,6 +38,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from contextlib import contextmanager
 
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, PieChart, Reference
@@ -1322,6 +1323,8 @@ class DatabaseManager:
                     LOWER(TRIM(publisher))
                 );
             """)
+            if commit:
+                self.connection.commit()
             cursor.execute("PRAGMA table_info(computers)")
             computer_columns = {row[1] for row in cursor.fetchall()}
 
@@ -1337,6 +1340,37 @@ class DatabaseManager:
         except sqlite3.Error as exc:
             AppLogger.log_message("error", f"Database initialization failed: {exc}")
 
+    def begin_transaction(self) -> None:
+        """Begin a caller-managed transaction if one is not already active."""
+        if not self.connection:
+            return
+
+        if self.connection.in_transaction:
+            return
+
+        self.connection.execute("BEGIN")
+
+    def commit_transaction(self) -> None:
+        """Commit the active caller-managed transaction."""
+        if self.connection and self.connection.in_transaction:
+            self.connection.commit()
+
+    def rollback_transaction(self) -> None:
+        """Rollback the active caller-managed transaction."""
+        if self.connection and self.connection.in_transaction:
+            self.connection.rollback()
+
+    @contextmanager
+    def transaction(self):
+        """Context manager for atomic write batches."""
+        self.begin_transaction()
+        try:
+            yield
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+
     def create_scan(self, ip_range: str, filters: str) -> Optional[int]:
         """Insert new scan record."""
         try:
@@ -1348,7 +1382,8 @@ class DatabaseManager:
                 VALUES (?, ?, ?, ?)
             """, (started_at, ip_range, filters, "running"))
 
-            self.connection.commit()
+            if commit:
+                self.connection.commit()
             return cursor.lastrowid
         except sqlite3.Error as exc:
             AppLogger.log_message("error", f"Create scan failed: {exc}")
@@ -1513,7 +1548,11 @@ class DatabaseManager:
             )
             return []
 
-    def insert_computer(self, record: ComputerRecord) -> Optional[int]:
+    def insert_computer(
+        self,
+        record: ComputerRecord,
+        commit: bool = True,
+    ) -> Optional[int]:
         """Insert computer record."""
         try:
             cursor = self.connection.cursor()
@@ -1553,6 +1592,7 @@ class DatabaseManager:
         computer_id: int,
         status: str,
         error: str = "",
+        commit: bool = True,
     ) -> None:
         """Update inventory status for a computer."""
         try:
@@ -1562,7 +1602,8 @@ class DatabaseManager:
                 SET inventory_status=?, inventory_error=?
                 WHERE computer_id=?
             """, (status, error, computer_id))
-            self.connection.commit()
+            if commit:
+                self.connection.commit()
         except sqlite3.Error as exc:
             AppLogger.log_message("error", f"Update computer failed: {exc}")
 
@@ -1570,6 +1611,7 @@ class DatabaseManager:
         self,
         computer_id: int,
         software_records: List[SoftwareRecord],
+        commit: bool = True,
     ) -> None:
         """
         Batch insert software records.
@@ -2838,6 +2880,8 @@ class ScanCoordinator:
 
     DEFAULT_PING_RETRY_COUNT = 1
     DEFAULT_MAX_PING_IN_FLIGHT = 64
+    DEFAULT_DB_BATCH_SIZE = 50
+    DEFAULT_DB_BATCH_SECONDS = 2.0
 
     def __init__(
         self,
@@ -2891,6 +2935,10 @@ class ScanCoordinator:
         self.total_software_records = 0
         self.unique_software_titles = 0
         self._software_keys: set = set()
+        self._db_batch_write_count = 0
+        self._db_last_commit_time = 0.0
+        self._db_batch_size = self.DEFAULT_DB_BATCH_SIZE
+        self._db_batch_seconds = self.DEFAULT_DB_BATCH_SECONDS
 
         self.ping_retry_count = self.DEFAULT_PING_RETRY_COUNT
         self.max_ping_in_flight = self.DEFAULT_MAX_PING_IN_FLIGHT
@@ -2946,6 +2994,7 @@ class ScanCoordinator:
         """Request cancellation of the active scan and stop managed pools."""
         self.stop_event.set()
         self.task_manager.cancel_all()
+
         self._emit_progress(
             phase="cancelled",
             message="Cancellation requested.",
@@ -3073,6 +3122,22 @@ class ScanCoordinator:
             "InventoryWorker",
         )
 
+        self._db_batch_size = self._safe_bounded_int(
+            self.options.get("db_batch_size"),
+            minimum=1,
+            maximum=1000,
+            default=self.DEFAULT_DB_BATCH_SIZE,
+        )
+        self._db_batch_seconds = float(
+            self.options.get("db_batch_seconds", self.DEFAULT_DB_BATCH_SECONDS)
+        )
+        if self._db_batch_seconds <= 0:
+            self._db_batch_seconds = self.DEFAULT_DB_BATCH_SECONDS
+
+        self.database_manager.begin_transaction()
+        self._db_batch_write_count = 0
+        self._db_last_commit_time = time.monotonic()
+
         self._fill_ping_window()
 
         self._emit_progress(
@@ -3089,13 +3154,14 @@ class ScanCoordinator:
             force_feed=True,
         )
 
-        while self._pipeline_has_work():
-            if self.stop_event.is_set():
-                break
+        try:
+            while self._pipeline_has_work():
+                if self.stop_event.is_set():
+                    break
 
-            self._process_completed_ping_futures()
-            self._process_completed_dns_futures()
-            self._process_completed_inventory_futures()
+                self._process_completed_ping_futures()
+                self._process_completed_dns_futures()
+                self._process_completed_inventory_futures()
 
             self._fill_ping_window()
 
@@ -3113,6 +3179,10 @@ class ScanCoordinator:
         self._process_completed_ping_futures()
         self._process_completed_dns_futures()
         self._process_completed_inventory_futures()
+        self._flush_db_batch(force=True)
+        except Exception:
+            self.database_manager.rollback_transaction()
+            raise
 
         self._emit_progress(
             phase="pipeline",
@@ -3251,7 +3321,11 @@ class ScanCoordinator:
                     continue
 
                 record.scan_id = self.scan_id
-                record.computer_id = self.database_manager.insert_computer(record)
+                record.computer_id = self.database_manager.insert_computer(
+                    record,
+                    commit=False,
+                )
+                self._mark_db_write()
                 self.computer_records.append(record)
 
                 self.task_manager.submit(
@@ -3304,11 +3378,15 @@ class ScanCoordinator:
                         computer.computer_id,
                         computer.inventory_status,
                         computer.inventory_error,
+                        commit=False,
                     )
+                    self._mark_db_write()
                     self.database_manager.insert_software_records(
                         computer.computer_id,
                         software_records,
+                        commit=False,
                     )
+                    self._mark_db_write()
 
             except Exception as exc:
                 self.inventory_completed += 1
@@ -3325,6 +3403,29 @@ class ScanCoordinator:
                         error=str(exc),
                     )
                 )
+
+    def _mark_db_write(self, count: int = 1) -> None:
+        """Track buffered database writes and commit periodically."""
+        self._db_batch_write_count += max(0, count)
+        self._flush_db_batch()
+
+    def _flush_db_batch(self, force: bool = False) -> None:
+        """Commit current write transaction and start a new batch when due."""
+        if self._db_batch_write_count <= 0 and not force:
+            return
+
+        elapsed = time.monotonic() - self._db_last_commit_time
+        should_commit = force or (
+            self._db_batch_write_count >= self._db_batch_size
+            or elapsed >= self._db_batch_seconds
+        )
+        if not should_commit:
+            return
+
+        self.database_manager.commit_transaction()
+        self.database_manager.begin_transaction()
+        self._db_batch_write_count = 0
+        self._db_last_commit_time = time.monotonic()
 
     def _emit_pipeline_progress_if_significant(self) -> None:
         """Emit a Live Feed phase message only for meaningful milestones."""
