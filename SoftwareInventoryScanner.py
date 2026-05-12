@@ -21,7 +21,6 @@ import shutil
 import socket
 import sqlite3
 import subprocess
-import sys
 import threading
 import time
 import atexit
@@ -30,7 +29,6 @@ import stat
 import tempfile
 import uuid
 import tkinter as tk
-import xml.etree.ElementTree as ET
 from collections import deque
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,12 +37,11 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tkinter import filedialog, ttk
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, PieChart, Reference
-from openpyxl.comments import Comment
-from openpyxl.formatting.rule import CellIsRule, ColorScaleRule, DataBarRule
+from openpyxl.formatting.rule import CellIsRule, DataBarRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.table import Table, TableStyleInfo
 import openpyxl.utils
@@ -7337,26 +7334,6 @@ class MainWindowLayout(ttk.Frame):
             selection_count=selection_count,
         )
 
-    def update_progress(self, progress: ScanProgress) -> None:
-        """
-        Update progress bar and status bar.
-
-        Args:
-            progress: Scan progress update.
-        """
-        total = max(1, int(progress.total or 0))
-        completed = max(0, min(total, int(progress.completed or 0)))
-        percent = int((completed / total) * 100)
-
-        self.progress_var.set(percent)
-        self.progress_label_var.set(f"{completed}/{total} ({percent}%)")
-
-        if progress.message:
-            self.update_status(
-                phase=progress.phase,
-                message=progress.message,
-            )
-
     def update_dashboard(self, summary: Dict[str, Any]) -> None:
         """
         Update dashboard tab.
@@ -7379,13 +7356,6 @@ class MainWindowLayout(ttk.Frame):
         """Process queued logs."""
         self.results_notebook.process_log_queue()
 
-    def clear_results(self) -> None:
-        """Clear result panels and reset progress."""
-        self.results_notebook.clear_results()
-        self.progress_var.set(0)
-        self.progress_label_var.set("0/0 (0%)")
-        self.status_bar.set_ready()
-    
     def reset_scan_progress(self) -> None:
         """Reset and show scan progress bars for a new scan."""
         self.ping_progress_var.set(0)
@@ -7410,6 +7380,12 @@ class MainWindowLayout(ttk.Frame):
 
         inventory_total = int(data.get("inventory_total", 0) or 0)
         inventory_completed = int(data.get("inventory_completed", 0) or 0)
+
+        # Backward compatibility: support legacy progress payloads that only
+        # populate top-level total/completed fields.
+        if not ping_total and not inventory_total:
+            inventory_total = max(0, int(progress.total or 0))
+            inventory_completed = max(0, int(progress.completed or 0))
 
         self._update_named_progress_bar(
             name="ping",
