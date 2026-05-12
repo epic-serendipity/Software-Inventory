@@ -1323,8 +1323,7 @@ class DatabaseManager:
                     LOWER(TRIM(publisher))
                 );
             """)
-            if commit:
-                self.connection.commit()
+            self.connection.commit()
             cursor.execute("PRAGMA table_info(computers)")
             computer_columns = {row[1] for row in cursor.fetchall()}
 
@@ -1382,8 +1381,7 @@ class DatabaseManager:
                 VALUES (?, ?, ?, ?)
             """, (started_at, ip_range, filters, "running"))
 
-            if commit:
-                self.connection.commit()
+            self.connection.commit()
             return cursor.lastrowid
         except sqlite3.Error as exc:
             AppLogger.log_message("error", f"Create scan failed: {exc}")
