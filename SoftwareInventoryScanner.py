@@ -70,12 +70,12 @@ class AppConfig:
     DEFAULT_REGISTRY_TIMEOUT = 60.0
 
     DEFAULT_MAX_PING_WORKERS = 64
-    DEFAULT_MAX_INVENTORY_WORKERS = 8
+    DEFAULT_MAX_INVENTORY_WORKERS = 32
 
     MIN_PING_WORKERS = 1
     MAX_PING_WORKERS = 256
     MIN_INVENTORY_WORKERS = 1
-    MAX_INVENTORY_WORKERS = 32
+    MAX_INVENTORY_WORKERS = 64
 
     LOG_FILE = "inventory_scanner.log"
     DATABASE_FILE = "inventory.db"
@@ -2556,7 +2556,7 @@ class RegistryInventoryScanner:
             AppConfig.MIN_INVENTORY_WORKERS,
             min(AppConfig.MAX_INVENTORY_WORKERS, int(max_workers)),
         )
-        target_workers = max(AppConfig.MIN_INVENTORY_WORKERS, min(4, max_worker_count))
+        target_workers = max(AppConfig.MIN_INVENTORY_WORKERS, min(32, max_worker_count))
         pending = deque(record for record in computer_records)
         in_flight: Dict[Any, ComputerRecord] = {}
         durations: deque = deque(maxlen=20)
@@ -2598,9 +2598,9 @@ class RegistryInventoryScanner:
                         error_rate = sum(failures) / len(failures)
                         winrm_rate = sum(winrm_failures) / max(1, len(winrm_failures))
                         if (error_rate >= 0.25 or winrm_rate >= 0.2) and target_workers > AppConfig.MIN_INVENTORY_WORKERS:
-                            target_workers -= 1
+                            target_workers = max(AppConfig.MIN_INVENTORY_WORKERS, target_workers - 8)
                         elif error_rate <= 0.12 and winrm_rate < 0.2 and pending and target_workers < max_worker_count:
-                            target_workers += 1
+                            target_workers = min(max_worker_count, target_workers + 8)
                     break
 
         return inventory_results
@@ -3691,7 +3691,7 @@ class ScanCoordinator:
         )
         self.inventory_worker_floor = max(
             AppConfig.MIN_INVENTORY_WORKERS,
-            min(4, self.inventory_worker_ceiling),
+            min(32, self.inventory_worker_ceiling),
         )
         subnet_hint = self._subnet_hint()
         adaptive = self.preferences_manager.get("adaptive_inventory_workers", {})
@@ -3721,11 +3721,11 @@ class ScanCoordinator:
         winrm_rate = sum(self.inventory_winrm_window) / max(1, len(self.inventory_winrm_window))
         queue_depth = len(self.pending_inventory_records)
         if (error_rate >= self.INVENTORY_SCALE_DOWN_ERROR_RATE or winrm_rate >= self.INVENTORY_SCALE_DOWN_WINRM_RATE) and self.inventory_target_workers > self.inventory_worker_floor:
-            self.inventory_target_workers -= 1
+            self.inventory_target_workers = max(self.inventory_worker_floor, self.inventory_target_workers - 8)
             AppLogger.log_message("warning", f"Adaptive inventory throttle: workers={self.inventory_target_workers}, error_rate={error_rate:.2f}, winrm_rate={winrm_rate:.2f}, median_latency={median_latency:.2f}s, queue_depth={queue_depth}")
             return
         if error_rate <= self.INVENTORY_SCALE_UP_ERROR_RATE and winrm_rate < self.INVENTORY_SCALE_DOWN_WINRM_RATE and queue_depth > 0 and self.inventory_target_workers < self.inventory_worker_ceiling:
-            self.inventory_target_workers += 1
+            self.inventory_target_workers = min(self.inventory_worker_ceiling, self.inventory_target_workers + 8)
             AppLogger.log_message("info", f"Adaptive inventory scale-up: workers={self.inventory_target_workers}, error_rate={error_rate:.2f}, winrm_rate={winrm_rate:.2f}, median_latency={median_latency:.2f}s, queue_depth={queue_depth}")
 
     def _subnet_hint(self) -> str:
@@ -4499,7 +4499,6 @@ class ScanControlPanel(ttk.Frame):
             self.ping_worker_spinbox,
             self.max_active_ping_spinbox,
             self.ping_retry_spinbox,
-            self.inventory_worker_spinbox,
             self.clear_button,
             self.export_button,
         )
@@ -4635,16 +4634,6 @@ class ScanControlPanel(ttk.Frame):
             width=4,
         )
         self.ping_retry_spinbox.pack(side="left", padx=(5, 12))
-
-        ttk.Label(options_frame, text="Inventory Workers:").pack(side="left")
-        self.inventory_worker_spinbox = ttk.Spinbox(
-            options_frame,
-            from_=AppConfig.MIN_INVENTORY_WORKERS,
-            to=AppConfig.MAX_INVENTORY_WORKERS,
-            textvariable=self.inventory_workers_var,
-            width=6,
-        )
-        self.inventory_worker_spinbox.pack(side="left", padx=(5, 12))
 
         button_frame = ttk.Frame(self)
         button_frame.grid(row=2, column=0, sticky="w", pady=(8, 0))
