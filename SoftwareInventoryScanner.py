@@ -837,7 +837,7 @@ class ScanInputValidator:
                 "error",
                 f"Failed to expand IP range: {exc}"
             )
-            return []
+            return [], {}
 
     @staticmethod
     def parse_device_filters(value: str) -> List[str]:
@@ -851,7 +851,7 @@ class ScanInputValidator:
             List of normalized filter prefixes.
         """
         if not value:
-            return []
+            return [], {}
 
         separators = [",", ";", "|"]
         normalized = value
@@ -1454,7 +1454,7 @@ class DatabaseManager:
             return cursor.fetchall()
         except sqlite3.Error as exc:
             AppLogger.log_message("error", f"Software occurrence query failed: {exc}")
-            return []
+            return [], {}
 
 
     def get_computer_breakout_for_software(
@@ -1546,7 +1546,7 @@ class DatabaseManager:
                 "error",
                 f"Computer breakout query failed: {exc}",
             )
-            return []
+            return [], {}
 
     def insert_computer(
         self,
@@ -1698,7 +1698,7 @@ class DatabaseManager:
             return rows
         except sqlite3.Error as exc:
             AppLogger.log_message("error", f"Computer count query failed: {exc}")
-            return []
+            return [], {}
 
     def get_computers_for_software(
         self,
@@ -1745,7 +1745,7 @@ class DatabaseManager:
             return rows
         except sqlite3.Error as exc:
             AppLogger.log_message("error", f"Computers for software query failed: {exc}")
-            return []
+            return [], {}
 
     def get_software_for_computer(
         self,
@@ -1764,7 +1764,7 @@ class DatabaseManager:
             return cursor.fetchall()
         except sqlite3.Error as exc:
             AppLogger.log_message("error", f"Software for computer query failed: {exc}")
-            return []
+            return [], {}
 
     def get_computer_properties(self, computer_id: int) -> Dict[str, Any]:
         """Return full computer properties."""
@@ -2412,10 +2412,19 @@ class RegistryInventoryScanner:
                     duration_seconds=duration,
                 )
 
-            software_records = self.parse_software_json(
+            software_records, telemetry = self.parse_software_json(
                 completed.stdout,
                 computer_record,
             )
+            if telemetry:
+                AppLogger.log_message(
+                    "debug",
+                    (
+                        f"Inventory timing for {target}: "
+                        f"session_create_ms={telemetry.get('session_create_ms', 0.0):.2f}, "
+                        f"query_ms={telemetry.get('query_ms', 0.0):.2f}"
+                    ),
+                )
             computer_record.mark_inventory_success()
 
             return computer_record, software_records, ScanResult(
@@ -2536,7 +2545,7 @@ class RegistryInventoryScanner:
             f"'{path}'" for path in AppConfig.REGISTRY_UNINSTALL_PATHS
         )
 
-        script_block = (
+        query_script = (
             "$paths = @("
             f"{registry_paths}"
             "); "
@@ -2546,14 +2555,33 @@ class RegistryInventoryScanner:
             "$items | Where-Object { $_.DisplayName } | "
             "Select-Object DisplayName, DisplayVersion, Publisher, "
             "InstallDate, UninstallString, InstallLocation, EstimatedSize, "
-            "PSChildName, PSPath | ConvertTo-Json -Compress"
+            "PSChildName, PSPath"
         )
 
         credential_argument = self.credential_manager.build_credential_argument()
         command = (
-            f"Invoke-Command -ComputerName \"{safe_hostname}\" "
-            f"{credential_argument} "
-            f"-ScriptBlock {{ {script_block} }}"
+            "$sessionCreateStart = Get-Date; "
+            f"$session = New-PSSession -ComputerName \"{safe_hostname}\" "
+            f"{credential_argument} -ErrorAction Stop; "
+            "$sessionCreateMs = ((Get-Date) - $sessionCreateStart).TotalMilliseconds; "
+            "try { "
+            "$queryStart = Get-Date; "
+            "$attempt = 0; "
+            "$maxAttempts = 2; "
+            "$result = $null; "
+            "while ($attempt -lt $maxAttempts -and -not $result) { "
+            "$attempt++; "
+            "try { "
+            f"$result = Invoke-Command -Session $session -ScriptBlock {{ {query_script} }} -ErrorAction Stop; "
+            "} catch { if ($attempt -ge $maxAttempts) { throw } } "
+            "}; "
+            "$queryMs = ((Get-Date) - $queryStart).TotalMilliseconds; "
+            "[PSCustomObject]@{ "
+            "SessionCreateMs = [Math]::Round($sessionCreateMs, 2); "
+            "QueryMs = [Math]::Round($queryMs, 2); "
+            "Data = $result "
+            "} | ConvertTo-Json -Compress -Depth 6 "
+            "} finally { if ($session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue } }"
         )
 
         command = self.credential_manager.apply_credentials_to_command(command)
@@ -2571,16 +2599,25 @@ class RegistryInventoryScanner:
         self,
         raw_json: str,
         computer_record: ComputerRecord,
-    ) -> List[SoftwareRecord]:
+    ) -> Tuple[List[SoftwareRecord], Dict[str, float]]:
         """
         Parse PowerShell JSON output into SoftwareRecord objects.
         """
         if not raw_json or not raw_json.strip():
-            return []
+            return [], {}
 
         try:
             parsed = json.loads(raw_json)
-            items = parsed if isinstance(parsed, list) else [parsed]
+            telemetry: Dict[str, float] = {}
+            if isinstance(parsed, dict) and "Data" in parsed:
+                telemetry = {
+                    "session_create_ms": float(parsed.get("SessionCreateMs") or 0.0),
+                    "query_ms": float(parsed.get("QueryMs") or 0.0),
+                }
+                data = parsed.get("Data")
+                items = data if isinstance(data, list) else ([data] if data else [])
+            else:
+                items = parsed if isinstance(parsed, list) else [parsed]
             records: List[SoftwareRecord] = []
 
             for item in items:
@@ -2613,7 +2650,7 @@ class RegistryInventoryScanner:
                 if record.is_valid():
                     records.append(record)
 
-            return records
+            return records, telemetry
 
         except json.JSONDecodeError as exc:
             AppLogger.log_message(
@@ -2621,7 +2658,7 @@ class RegistryInventoryScanner:
                 f"JSON parse failure for "
                 f"{computer_record.hostname or computer_record.ip_address}: {exc}",
             )
-            return []
+            return [], {}
 
     def classify_error(self, error_text: str) -> str:
         """
@@ -3163,23 +3200,23 @@ class ScanCoordinator:
                 self._process_completed_dns_futures()
                 self._process_completed_inventory_futures()
 
-            self._fill_ping_window()
+                self._fill_ping_window()
 
-            if self.stop_event.is_set():
-                break
+                if self.stop_event.is_set():
+                    break
 
-            self.task_manager.wait_for_completion(timeout=0.05)
+                self.task_manager.wait_for_completion(timeout=0.05)
 
-            if self.stop_event.is_set():
-                break
+                if self.stop_event.is_set():
+                    break
 
-            self._emit_pipeline_progress_if_significant()
-            self._emit_dashboard_progress_if_due()
+                self._emit_pipeline_progress_if_significant()
+                self._emit_dashboard_progress_if_due()
 
-        self._process_completed_ping_futures()
-        self._process_completed_dns_futures()
-        self._process_completed_inventory_futures()
-        self._flush_db_batch(force=True)
+            self._process_completed_ping_futures()
+            self._process_completed_dns_futures()
+            self._process_completed_inventory_futures()
+            self._flush_db_batch(force=True)
         except Exception:
             self.database_manager.rollback_transaction()
             raise
@@ -8140,7 +8177,7 @@ class ExcelExportManager:
                 "error",
                 f"Inventory detail export query failed: {exc}",
             )
-            return []
+            return [], {}
 
     def _build_dashboard_sheet(
         self,
