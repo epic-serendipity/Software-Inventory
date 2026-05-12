@@ -6726,6 +6726,9 @@ class LogsPanel(ttk.Frame):
         super().__init__(parent, padding=10)
 
         self.log_queue = log_queue
+        self.level_var = tk.StringVar(value="INFO+")
+        self.auto_scroll_var = tk.BooleanVar(value=True)
+        self._records: List[str] = []
         self._create_widgets()
 
     def append_log(self, text: str) -> None:
@@ -6738,11 +6741,16 @@ class LogsPanel(ttk.Frame):
         if not text:
             return
 
+        self._records.append(text.rstrip())
+        if not self._passes_level_filter(text):
+            return
+
         self.text.configure(state="normal")
         self.text.insert("end", text.rstrip() + "\n")
         self._apply_color(text)
         self.text.configure(state="disabled")
-        self.text.see("end")
+        if self.auto_scroll_var.get():
+            self.text.see("end")
 
     def process_log_queue(self) -> None:
         """
@@ -6759,6 +6767,7 @@ class LogsPanel(ttk.Frame):
 
     def clear_logs(self) -> None:
         """Clear log display."""
+        self._records.clear()
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.configure(state="disabled")
@@ -6790,11 +6799,67 @@ class LogsPanel(ttk.Frame):
             tag = "warning"
         elif "info" in lowered:
             tag = "info"
+        elif "debug" in lowered:
+            tag = "debug"
 
         if tag:
             start_index = self.text.index("end-2l")
             end_index = self.text.index("end-1l")
             self.text.tag_add(tag, start_index, end_index)
+
+    def _passes_level_filter(self, text: str) -> bool:
+        """
+        Check whether a log message should be displayed for current filter.
+
+        Args:
+            text: Full log message line.
+        """
+        selected = self.level_var.get()
+        lowered = text.lower()
+        level_order = {
+            "DEBUG": 10,
+            "INFO": 20,
+            "WARNING": 30,
+            "ERROR": 40,
+            "CRITICAL": 50,
+        }
+        selected_threshold = {
+            "DEBUG+": "DEBUG",
+            "INFO+": "INFO",
+            "WARNING+": "WARNING",
+            "ERROR+": "ERROR",
+            "CRITICAL": "CRITICAL",
+        }.get(selected, "INFO")
+
+        record_level_name = "INFO"
+        for candidate in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"):
+            if candidate.lower() in lowered:
+                record_level_name = candidate
+                break
+
+        return (
+            level_order[record_level_name]
+            >= level_order[selected_threshold]
+        )
+
+    def _refresh_visible_logs(self) -> None:
+        """Rebuild text area from cached records using current filter."""
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+
+        for record in self._records:
+            if not self._passes_level_filter(record):
+                continue
+            self.text.insert("end", record + "\n")
+            self._apply_color(record)
+
+        self.text.configure(state="disabled")
+        if self.auto_scroll_var.get():
+            self.text.see("end")
+
+    def _on_level_changed(self, _event: Optional[tk.Event] = None) -> None:
+        """Handle user log-level dropdown changes."""
+        self._refresh_visible_logs()
 
     def _create_widgets(self) -> None:
         """Create logs panel layout."""
@@ -6824,6 +6889,28 @@ class LogsPanel(ttk.Frame):
         )
         self.copy_button.pack(side="left")
 
+        ttk.Label(
+            control_frame,
+            text="Level:",
+        ).pack(side="left", padx=(12, 4))
+
+        self.level_combobox = ttk.Combobox(
+            control_frame,
+            textvariable=self.level_var,
+            values=("DEBUG+", "INFO+", "WARNING+", "ERROR+", "CRITICAL"),
+            state="readonly",
+            width=10,
+        )
+        self.level_combobox.pack(side="left")
+        self.level_combobox.bind("<<ComboboxSelected>>", self._on_level_changed)
+
+        self.auto_scroll_check = ttk.Checkbutton(
+            control_frame,
+            text="Auto-scroll",
+            variable=self.auto_scroll_var,
+        )
+        self.auto_scroll_check.pack(side="left", padx=(12, 0))
+
         text_frame = ttk.Frame(self)
         text_frame.pack(fill="both", expand=True)
 
@@ -6849,6 +6936,7 @@ class LogsPanel(ttk.Frame):
         self.text.tag_configure("error", foreground="red")
         self.text.tag_configure("warning", foreground="orange")
         self.text.tag_configure("info", foreground="black")
+        self.text.tag_configure("debug", foreground="#5C6370")
     
 # ------------------ Status Bar ------------------ #
 class StatusBar(ttk.Frame):
