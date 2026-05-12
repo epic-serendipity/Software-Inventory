@@ -37,7 +37,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from contextlib import contextmanager
 
@@ -1404,6 +1404,91 @@ class DatabaseManager:
             AppLogger.log_message("info", "Database initialized.")
         except sqlite3.Error as exc:
             AppLogger.log_message("error", f"Database initialization failed: {exc}")
+            self._handle_database_initialization_failure(exc)
+
+    def _handle_database_initialization_failure(self, original_error: sqlite3.Error) -> None:
+        """
+        Attempt automated database repair. If repair fails, prompt user to delete old databases.
+        """
+        if not self.connection:
+            return
+
+        try:
+            self._attempt_database_repair()
+            AppLogger.log_message("warning", "Database repair completed after initialization failure.")
+            return
+        except sqlite3.Error as repair_error:
+            AppLogger.log_message("error", f"Database repair failed: {repair_error}")
+
+        if self._prompt_delete_associated_databases():
+            deleted_files = self._delete_associated_database_files()
+            if deleted_files:
+                AppLogger.log_message(
+                    "warning",
+                    f"Deleted associated database files: {', '.join(deleted_files)}",
+                )
+            self._recreate_connection_and_initialize()
+            return
+
+        raise RuntimeError(
+            "Database initialization failed and recovery was declined."
+        ) from original_error
+
+    def _attempt_database_repair(self) -> None:
+        """
+        Perform lightweight schema repair for outdated databases.
+        """
+        if not self.connection:
+            raise sqlite3.OperationalError("Database connection unavailable.")
+
+        cursor = self.connection.cursor()
+        cursor.execute("PRAGMA foreign_keys = OFF")
+        cursor.execute("PRAGMA writable_schema = ON")
+        cursor.execute("PRAGMA writable_schema = OFF")
+        cursor.execute("REINDEX")
+        cursor.execute("PRAGMA optimize")
+        self.connection.commit()
+
+    def _prompt_delete_associated_databases(self) -> bool:
+        """Ask user whether old associated database files should be deleted."""
+        return messagebox.askyesno(
+            "Database Recovery",
+            (
+                "The database could not be initialized or repaired.\n\n"
+                "Would you like to delete associated old database files and "
+                "recreate a fresh database?"
+            ),
+        )
+
+    def _delete_associated_database_files(self) -> List[str]:
+        """Delete database files associated with the configured database name."""
+        db_dir = self.db_path.parent if self.db_path.parent else Path(".")
+        db_stem = self.db_path.stem
+        associated_files = sorted(db_dir.glob(f"{db_stem}*.db*"))
+        deleted_files: List[str] = []
+
+        for file_path in associated_files:
+            try:
+                if file_path.is_file():
+                    file_path.unlink()
+                    deleted_files.append(str(file_path))
+            except OSError as exc:
+                AppLogger.log_message(
+                    "error",
+                    f"Failed to delete database file '{file_path}': {exc}",
+                )
+        return deleted_files
+
+    def _recreate_connection_and_initialize(self) -> None:
+        """Close and reopen database connection, then run initialization again."""
+        if self.connection:
+            try:
+                self.connection.close()
+            except sqlite3.Error:
+                pass
+        self.connection = None
+        self._connect()
+        self.initialize_database()
 
     def begin_transaction(self) -> None:
         """Begin a caller-managed transaction if one is not already active."""
