@@ -2203,7 +2203,7 @@ class HostnameResolver:
             return
 
         AppLogger.log_message(
-            "warning",
+            "debug",
             f"DNS resolution failed for {ip_address}: {exc}",
         )
 
@@ -3216,6 +3216,12 @@ class ScanCoordinator:
                     self.inventory_success_count += 1
                 elif computer.inventory_status == AppConfig.INVENTORY_STATUS_FAILED:
                     self.inventory_failed_count += 1
+                    inventory_target = computer.hostname or computer.ip_address or "Unknown"
+                    inventory_reason = computer.inventory_error or scan_result.error or "Unknown reason"
+                    AppLogger.log_message(
+                        "error",
+                        f"Inventory failed for {inventory_target} ({computer.ip_address or 'no-ip'}): {inventory_reason}",
+                    )
 
                 self.total_software_records += len(software_records)
 
@@ -3418,6 +3424,18 @@ class ScanCoordinator:
         )
 
         AppLogger.log_message("info", message)
+        AppLogger.log_message(
+            "info",
+            (
+                "Scan summary: "
+                f"status={summary.get('status')}, "
+                f"pingable={summary.get('pingable_count', 0)}/{summary.get('total_scanned', 0)}, "
+                f"matched={summary.get('matched_count', 0)}, "
+                f"inventory_success={summary.get('successful_inventory_count', 0)}, "
+                f"inventory_failed={summary.get('failed_inventory_count', 0)}, "
+                f"duration_seconds={summary.get('duration_seconds', 0)}"
+            ),
+        )
 
     def calculate_summary(self, include_duration: bool = True) -> Dict[str, Any]:
         """
