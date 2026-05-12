@@ -2579,6 +2579,7 @@ class ThreadTaskManager:
         self._executors: Dict[str, ThreadPoolExecutor] = {}
         self._futures: Dict[str, List[Any]] = {}
         self._lock = threading.RLock()
+        self._completion_event = threading.Event()
 
     def create_pool(
         self,
@@ -2645,6 +2646,7 @@ class ThreadTaskManager:
 
             try:
                 future = executor.submit(function, *args, **kwargs)
+                future.add_done_callback(lambda _: self._completion_event.set())
                 self._futures.setdefault(pool_name, []).append(future)
                 return future
             except RuntimeError as exc:
@@ -2671,7 +2673,28 @@ class ThreadTaskManager:
                 future for future in futures
                 if not future.done()
             ]
+
+            if not any(
+                tracked_future.done()
+                for tracked_futures in self._futures.values()
+                for tracked_future in tracked_futures
+            ):
+                self._completion_event.clear()
+
             return ready
+
+
+    def wait_for_completion(self, timeout: float) -> bool:
+        """
+        Wait for any tracked future to complete.
+
+        Args:
+            timeout: Maximum wait time in seconds.
+
+        Returns:
+            True when at least one completion was signaled, else False.
+        """
+        return self._completion_event.wait(timeout=max(0.0, float(timeout)))
 
     def has_pending(self, pool_name: Optional[str] = None) -> bool:
         """
@@ -3030,10 +3053,17 @@ class ScanCoordinator:
             self._process_completed_inventory_futures()
 
             self._fill_ping_window()
+
+            if self.stop_event.is_set():
+                break
+
+            self.task_manager.wait_for_completion(timeout=0.05)
+
+            if self.stop_event.is_set():
+                break
+
             self._emit_pipeline_progress_if_significant()
             self._emit_dashboard_progress_if_due()
-
-            time.sleep(0.05)
 
         self._process_completed_ping_futures()
         self._process_completed_dns_futures()
