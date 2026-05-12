@@ -6375,6 +6375,7 @@ class LiveFeedPanel(ttk.Frame):
         super().__init__(parent, padding=10)
 
         self.auto_scroll_var = tk.BooleanVar(value=True)
+        self._last_normalized_entry = ""
         self._create_widgets()
 
     def append_live_feed(self, text: str) -> None:
@@ -6387,8 +6388,17 @@ class LiveFeedPanel(ttk.Frame):
         if not text:
             return
 
+        normalized = text.strip()
+        if not normalized:
+            return
+
+        if normalized == self._last_normalized_entry:
+            return
+
+        self._last_normalized_entry = normalized
+
         self.text.configure(state="normal")
-        self.text.insert("end", text.rstrip() + "\n")
+        self.text.insert("end", normalized + "\n")
         self.text.configure(state="disabled")
 
         if self.auto_scroll_var.get():
@@ -6399,6 +6409,7 @@ class LiveFeedPanel(ttk.Frame):
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.configure(state="disabled")
+        self._last_normalized_entry = ""
         AppLogger.log_message("debug", "Live feed cleared.")
 
     def copy_feed(self) -> None:
@@ -6749,10 +6760,9 @@ class ResultsNotebook(ttk.Frame):
     """
     Own all result tabs and tab-to-tab navigation.
 
-    Tabs remain open after navigation, but are ordered and visually grouped by
-    category. Tkinter themes do not reliably support full per-tab background
-    colors, so this class uses category labels and small color swatches beside
-    tab text while preserving normal ttk Notebook behavior.
+    Tabs remain open after navigation and are ordered by category.
+    The selected tab is color-tinted by category so the full tab header is
+    highlighted instead of a small color swatch.
     """
 
     TAB_CATEGORIES = {
@@ -6787,12 +6797,12 @@ class ResultsNotebook(ttk.Frame):
         self.current_scan_id: Optional[int] = None
 
         self._tab_widgets: Dict[str, tk.Widget] = {}
-        self._tab_images: Dict[str, tk.PhotoImage] = {}
         self._breakout_request_id = 0
 
         self._create_widgets()
         self._create_tabs()
         self._sort_tabs_by_category()
+        self._apply_selected_tab_color()
 
     def set_current_scan_id(self, scan_id: Optional[int]) -> None:
         """
@@ -7051,8 +7061,10 @@ class ResultsNotebook(ttk.Frame):
 
     def _create_widgets(self) -> None:
         """Create Notebook widget."""
-        self.notebook = ttk.Notebook(self)
+        self._configure_notebook_style()
+        self.notebook = ttk.Notebook(self, style="Results.TNotebook")
         self.notebook.pack(fill="both", expand=True)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _create_tabs(self) -> None:
         """Create all result tabs."""
@@ -7096,8 +7108,6 @@ class ResultsNotebook(ttk.Frame):
             self.notebook.add(
                 widget,
                 text=self._tab_label(tab_name),
-                image=self._tab_image(tab_name),
-                compound="left",
                 padding=(8, 3),
             )
 
@@ -7152,6 +7162,7 @@ class ResultsNotebook(ttk.Frame):
             return
 
         self.notebook.select(widget)
+        self._apply_selected_tab_color()
 
     def _tab_label(self, tab_name: str) -> str:
         """
@@ -7163,34 +7174,48 @@ class ResultsNotebook(ttk.Frame):
         Returns:
             Display tab label.
         """
-        category, _color, _order = self.TAB_CATEGORIES.get(
-            tab_name,
-            ("System", "#D9EAF7", 99),
+        return tab_name
+
+    def _configure_notebook_style(self) -> None:
+        """Configure base notebook styles used for full-tab color highlighting."""
+        style = ttk.Style(self)
+        style.configure(
+            "Results.TNotebook.Tab",
+            padding=(12, 6),
+            background="#E6E6E6",
         )
-        return f"{category}: {tab_name}"
-
-    def _tab_image(self, tab_name: str) -> tk.PhotoImage:
-        """
-        Build or return a small color swatch image for a tab.
-
-        Args:
-            tab_name: Tab name.
-
-        Returns:
-            Tk PhotoImage used beside tab text.
-        """
-        category, color, _order = self.TAB_CATEGORIES.get(
-            tab_name,
-            ("System", "#D9EAF7", 99),
+        style.map(
+            "Results.TNotebook.Tab",
+            background=[("selected", "#D9EAF7")],
         )
 
-        if category in self._tab_images:
-            return self._tab_images[category]
+    def _on_tab_changed(self, _event: tk.Event) -> None:
+        """Refresh selected tab coloring when the active tab changes."""
+        self._apply_selected_tab_color()
 
-        image = tk.PhotoImage(width=12, height=12)
-        image.put(color, to=(0, 0, 12, 12))
-        self._tab_images[category] = image
-        return image
+    def _apply_selected_tab_color(self) -> None:
+        """Tint the selected tab using the tab category color."""
+        selected = self.notebook.select()
+        if not selected:
+            return
+
+        selected_widget = self.nametowidget(selected)
+        selected_name = next(
+            (name for name, widget in self._tab_widgets.items() if widget == selected_widget),
+            None,
+        )
+        if not selected_name:
+            return
+
+        _category, color, _order = self.TAB_CATEGORIES.get(
+            selected_name,
+            ("System", "#D9EAF7", 99),
+        )
+        style = ttk.Style(self)
+        style.map(
+            "Results.TNotebook.Tab",
+            background=[("selected", color)],
+        )
 
 # ------------------ Main Window Layout ------------------ #
 class MainWindowLayout(ttk.Frame):
