@@ -29,6 +29,7 @@ import stat
 import tempfile
 import uuid
 import tkinter as tk
+import statistics
 from collections import deque
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -69,12 +70,12 @@ class AppConfig:
     DEFAULT_REGISTRY_TIMEOUT = 60.0
 
     DEFAULT_MAX_PING_WORKERS = 64
-    DEFAULT_MAX_INVENTORY_WORKERS = 8
+    DEFAULT_MAX_INVENTORY_WORKERS = 32
 
     MIN_PING_WORKERS = 1
     MAX_PING_WORKERS = 256
     MIN_INVENTORY_WORKERS = 1
-    MAX_INVENTORY_WORKERS = 32
+    MAX_INVENTORY_WORKERS = 64
 
     LOG_FILE = "inventory_scanner.log"
     DATABASE_FILE = "inventory.db"
@@ -2489,48 +2490,56 @@ class RegistryInventoryScanner:
         Inventory multiple computers concurrently.
         """
         inventory_results: List[Tuple[ComputerRecord, List[SoftwareRecord]]] = []
-        worker_count = max(
+        max_worker_count = max(
             AppConfig.MIN_INVENTORY_WORKERS,
             min(AppConfig.MAX_INVENTORY_WORKERS, int(max_workers)),
         )
+        target_workers = max(AppConfig.MIN_INVENTORY_WORKERS, min(32, max_worker_count))
+        pending = deque(record for record in computer_records)
+        in_flight: Dict[Any, ComputerRecord] = {}
+        durations: deque = deque(maxlen=20)
+        failures: deque = deque(maxlen=20)
+        winrm_failures: deque = deque(maxlen=20)
 
-        with ThreadPoolExecutor(
-            max_workers=worker_count,
-            thread_name_prefix="InventoryWorker",
-        ) as executor:
-            future_map = {
-                executor.submit(self.inventory_computer, record): record
-                for record in computer_records
-                if not stop_event.is_set()
-            }
-
-            for future in as_completed(future_map):
-                if stop_event.is_set():
-                    break
-
-                record = future_map[future]
-                target = record.hostname or record.ip_address
-
+        with ThreadPoolExecutor(max_workers=max_worker_count, thread_name_prefix="InventoryWorker") as executor:
+            while (pending or in_flight) and not stop_event.is_set():
+                while pending and len(in_flight) < target_workers and not stop_event.is_set():
+                    record = pending.popleft()
+                    in_flight[executor.submit(self.inventory_computer, record)] = record
+                if not in_flight:
+                    continue
                 try:
-                    computer, software_records, scan_result = future.result()
-                    result_queue.put(scan_result)
-                    inventory_results.append((computer, software_records))
-                except Exception as exc:
-                    AppLogger.log_message(
-                        "error",
-                        f"Unhandled inventory worker error for {target}: {exc}",
-                    )
-                    record.mark_inventory_failure(str(exc))
-                    result_queue.put(
-                        ScanResult(
-                            task_name="Inventory",
-                            target=target,
-                            status=AppConfig.SCAN_STATUS_ERROR,
-                            message="Unhandled inventory worker error.",
-                            error=str(exc),
-                        )
-                    )
-                    inventory_results.append((record, []))
+                    completed_futures = as_completed(list(in_flight.keys()), timeout=0.2)
+                    future = next(completed_futures)
+                except Exception:
+                    continue
+                for future in [future]:
+                    record = in_flight.pop(future)
+                    target = record.hostname or record.ip_address
+                    try:
+                        computer, software_records, scan_result = future.result()
+                        result_queue.put(scan_result)
+                        inventory_results.append((computer, software_records))
+                        durations.append(max(0.0, float(scan_result.duration_seconds or 0.0)))
+                        failed = computer.inventory_status == AppConfig.INVENTORY_STATUS_FAILED
+                        failures.append(1 if failed else 0)
+                        reason = (computer.inventory_error or scan_result.error or "").lower()
+                        winrm_failures.append(1 if any(t in reason for t in ("winrm", "cannot connect", "host offline", "rpc")) else 0)
+                    except Exception as exc:
+                        AppLogger.log_message("error", f"Unhandled inventory worker error for {target}: {exc}")
+                        record.mark_inventory_failure(str(exc))
+                        failures.append(1)
+                        winrm_failures.append(0)
+                        result_queue.put(ScanResult(task_name="Inventory", target=target, status=AppConfig.SCAN_STATUS_ERROR, message="Unhandled inventory worker error.", error=str(exc)))
+                        inventory_results.append((record, []))
+                    if len(failures) >= 8:
+                        error_rate = sum(failures) / len(failures)
+                        winrm_rate = sum(winrm_failures) / max(1, len(winrm_failures))
+                        if (error_rate >= 0.25 or winrm_rate >= 0.2) and target_workers > AppConfig.MIN_INVENTORY_WORKERS:
+                            target_workers = max(AppConfig.MIN_INVENTORY_WORKERS, target_workers - 8)
+                        elif error_rate <= 0.12 and winrm_rate < 0.2 and pending and target_workers < max_worker_count:
+                            target_workers = min(max_worker_count, target_workers + 8)
+                    break
 
         return inventory_results
 
@@ -2917,12 +2926,18 @@ class ScanCoordinator:
     DEFAULT_MAX_PING_IN_FLIGHT = 64
     DEFAULT_DB_BATCH_SIZE = 50
     DEFAULT_DB_BATCH_SECONDS = 2.0
+    INVENTORY_WINDOW_SIZE = 20
+    INVENTORY_ADJUST_INTERVAL = 8
+    INVENTORY_SCALE_UP_ERROR_RATE = 0.12
+    INVENTORY_SCALE_DOWN_ERROR_RATE = 0.25
+    INVENTORY_SCALE_DOWN_WINRM_RATE = 0.2
 
     def __init__(
         self,
         database_manager: DatabaseManager,
         result_queue: queue.Queue,
         credential_manager: Optional[CredentialManager] = None,
+        preferences_manager: Optional[PreferencesManager] = None,
     ):
         """
         Initialize scan coordinator.
@@ -2935,6 +2950,7 @@ class ScanCoordinator:
         self.database_manager = database_manager
         self.result_queue = result_queue
         self.credential_manager = credential_manager or CredentialManager()
+        self.preferences_manager = preferences_manager or PreferencesManager()
 
         self.validator = ScanInputValidator()
         self.ip_scanner = IpRangeScanner()
@@ -2961,6 +2977,14 @@ class ScanCoordinator:
         self.pingable_ips: List[str] = []
         self.computer_records: List[ComputerRecord] = []
         self.inventory_results: List[Tuple[ComputerRecord, List[SoftwareRecord]]] = []
+        self.pending_inventory_records: deque = deque()
+        self.inventory_in_flight = 0
+        self.inventory_target_workers = AppConfig.DEFAULT_MAX_INVENTORY_WORKERS
+        self.inventory_worker_floor = AppConfig.MIN_INVENTORY_WORKERS
+        self.inventory_worker_ceiling = AppConfig.DEFAULT_MAX_INVENTORY_WORKERS
+        self.inventory_duration_window: deque = deque(maxlen=self.INVENTORY_WINDOW_SIZE)
+        self.inventory_failure_window: deque = deque(maxlen=self.INVENTORY_WINDOW_SIZE)
+        self.inventory_winrm_window: deque = deque(maxlen=self.INVENTORY_WINDOW_SIZE)
 
         self.ping_completed = 0
         self.resolved_count = 0
@@ -3132,6 +3156,7 @@ class ScanCoordinator:
             AppConfig.MAX_INVENTORY_WORKERS,
             AppConfig.DEFAULT_MAX_INVENTORY_WORKERS,
         )
+        self._initialize_inventory_worker_bounds(inventory_workers)
 
         dns_workers = max(
             AppConfig.MIN_PING_WORKERS,
@@ -3196,7 +3221,9 @@ class ScanCoordinator:
 
                 self._process_completed_ping_futures()
                 self._process_completed_dns_futures()
+                self._dispatch_inventory_work()
                 self._process_completed_inventory_futures()
+                self._dispatch_inventory_work()
 
                 self._fill_ping_window()
 
@@ -3214,6 +3241,7 @@ class ScanCoordinator:
             self._process_completed_ping_futures()
             self._process_completed_dns_futures()
             self._process_completed_inventory_futures()
+            self._dispatch_inventory_work()
             self._flush_db_batch(force=True)
         except Exception:
             self.database_manager.rollback_transaction()
@@ -3362,12 +3390,7 @@ class ScanCoordinator:
                 )
                 self._mark_db_write()
                 self.computer_records.append(record)
-
-                self.task_manager.submit(
-                    self.INVENTORY_POOL,
-                    self.inventory_scanner.inventory_computer,
-                    record,
-                )
+                self.pending_inventory_records.append(record)
 
             except Exception as exc:
                 self.resolved_count += 1
@@ -3392,6 +3415,7 @@ class ScanCoordinator:
 
             try:
                 computer, software_records, scan_result = future.result()
+                self.inventory_in_flight = max(0, self.inventory_in_flight - 1)
                 self.result_queue.put(scan_result)
                 self.inventory_results.append((computer, software_records))
                 self.inventory_completed += 1
@@ -3408,6 +3432,8 @@ class ScanCoordinator:
                     )
 
                 self.total_software_records += len(software_records)
+                self._record_inventory_metrics(scan_result, computer)
+                self._adjust_inventory_workers_if_needed()
 
                 for record in software_records:
                     self._software_keys.add(record.normalized_key())
@@ -3430,6 +3456,7 @@ class ScanCoordinator:
                     self._mark_db_write()
 
             except Exception as exc:
+                self.inventory_in_flight = max(0, self.inventory_in_flight - 1)
                 self.inventory_completed += 1
                 self.inventory_failed_count += 1
                 AppLogger.log_message(
@@ -3576,8 +3603,82 @@ class ScanCoordinator:
             bool(self.pending_ping_ips)
             or self.task_manager.has_pending(self.PING_POOL)
             or self.task_manager.has_pending(self.DNS_POOL)
+            or bool(self.pending_inventory_records)
             or self.task_manager.has_pending(self.INVENTORY_POOL)
         )
+
+    def _dispatch_inventory_work(self) -> None:
+        while (
+            self.pending_inventory_records
+            and self.inventory_in_flight < self.inventory_target_workers
+            and not self.stop_event.is_set()
+        ):
+            record = self.pending_inventory_records.popleft()
+            future = self.task_manager.submit(
+                self.INVENTORY_POOL,
+                self.inventory_scanner.inventory_computer,
+                record,
+            )
+            if future:
+                self.inventory_in_flight += 1
+
+    def _initialize_inventory_worker_bounds(self, configured_workers: int) -> None:
+        self.inventory_worker_ceiling = max(
+            AppConfig.MIN_INVENTORY_WORKERS,
+            configured_workers,
+        )
+        self.inventory_worker_floor = max(
+            AppConfig.MIN_INVENTORY_WORKERS,
+            min(32, self.inventory_worker_ceiling),
+        )
+        subnet_hint = self._subnet_hint()
+        adaptive = self.preferences_manager.get("adaptive_inventory_workers", {})
+        if isinstance(adaptive, dict) and subnet_hint in adaptive:
+            profile = adaptive.get(subnet_hint, {})
+            minimum = int(profile.get("min", self.inventory_worker_floor))
+            maximum = int(profile.get("max", self.inventory_worker_ceiling))
+            self.inventory_worker_floor = max(AppConfig.MIN_INVENTORY_WORKERS, min(minimum, self.inventory_worker_ceiling))
+            self.inventory_worker_ceiling = max(self.inventory_worker_floor, min(maximum, configured_workers))
+        self.inventory_target_workers = self.inventory_worker_floor
+
+    def _record_inventory_metrics(self, scan_result: ScanResult, computer: ComputerRecord) -> None:
+        self.inventory_duration_window.append(max(0.0, float(scan_result.duration_seconds or 0.0)))
+        failed = computer.inventory_status == AppConfig.INVENTORY_STATUS_FAILED
+        self.inventory_failure_window.append(1 if failed else 0)
+        reason = (computer.inventory_error or scan_result.error or "").lower()
+        winrm_like = any(token in reason for token in ("winrm", "cannot connect", "host offline", "rpc"))
+        self.inventory_winrm_window.append(1 if winrm_like else 0)
+
+    def _adjust_inventory_workers_if_needed(self) -> None:
+        if len(self.inventory_failure_window) < self.INVENTORY_ADJUST_INTERVAL:
+            return
+        if self.inventory_completed % self.INVENTORY_ADJUST_INTERVAL != 0:
+            return
+        median_latency = statistics.median(self.inventory_duration_window) if self.inventory_duration_window else 0.0
+        error_rate = sum(self.inventory_failure_window) / max(1, len(self.inventory_failure_window))
+        winrm_rate = sum(self.inventory_winrm_window) / max(1, len(self.inventory_winrm_window))
+        queue_depth = len(self.pending_inventory_records)
+        if (error_rate >= self.INVENTORY_SCALE_DOWN_ERROR_RATE or winrm_rate >= self.INVENTORY_SCALE_DOWN_WINRM_RATE) and self.inventory_target_workers > self.inventory_worker_floor:
+            self.inventory_target_workers = max(self.inventory_worker_floor, self.inventory_target_workers - 8)
+            AppLogger.log_message("warning", f"Adaptive inventory throttle: workers={self.inventory_target_workers}, error_rate={error_rate:.2f}, winrm_rate={winrm_rate:.2f}, median_latency={median_latency:.2f}s, queue_depth={queue_depth}")
+            return
+        if error_rate <= self.INVENTORY_SCALE_UP_ERROR_RATE and winrm_rate < self.INVENTORY_SCALE_DOWN_WINRM_RATE and queue_depth > 0 and self.inventory_target_workers < self.inventory_worker_ceiling:
+            self.inventory_target_workers = min(self.inventory_worker_ceiling, self.inventory_target_workers + 8)
+            AppLogger.log_message("info", f"Adaptive inventory scale-up: workers={self.inventory_target_workers}, error_rate={error_rate:.2f}, winrm_rate={winrm_rate:.2f}, median_latency={median_latency:.2f}s, queue_depth={queue_depth}")
+
+    def _subnet_hint(self) -> str:
+        raw = str(self.ip_range or "").strip()
+        if "-" in raw:
+            raw = raw.split("-", 1)[0].strip()
+        if "/" in raw:
+            return raw
+        try:
+            ip_obj = ipaddress.ip_address(raw)
+            if isinstance(ip_obj, ipaddress.IPv4Address):
+                return ".".join(raw.split(".")[:3]) + ".0/24"
+        except ValueError:
+            pass
+        return raw or "default"
 
     def finalize_scan(
         self,
@@ -3611,6 +3712,7 @@ class ScanCoordinator:
 
         if self.scan_id:
             self.database_manager.complete_scan(self.scan_id, summary)
+        self._persist_inventory_worker_profile()
 
         self.result_queue.put(
             ScanProgress(
@@ -3623,7 +3725,6 @@ class ScanCoordinator:
                 data=summary,
             )
         )
-
         self.result_queue.put(
             ScanResult(
                 scan_id=self.scan_id,
@@ -3647,6 +3748,20 @@ class ScanCoordinator:
                 f"duration_seconds={summary.get('duration_seconds', 0)}"
             ),
         )
+
+    def _persist_inventory_worker_profile(self) -> None:
+        if self.inventory_completed <= 0:
+            return
+        subnet = self._subnet_hint()
+        adaptive = self.preferences_manager.get("adaptive_inventory_workers", {})
+        if not isinstance(adaptive, dict):
+            adaptive = {}
+        adaptive[subnet] = {
+            "min": int(self.inventory_worker_floor),
+            "max": int(max(self.inventory_worker_floor, self.inventory_target_workers)),
+            "updated_at": datetime.now().strftime(AppConfig.STORAGE_TIMESTAMP_FORMAT),
+        }
+        self.preferences_manager.set("adaptive_inventory_workers", adaptive)
 
     def calculate_summary(self, include_duration: bool = True) -> Dict[str, Any]:
         """
@@ -4322,7 +4437,6 @@ class ScanControlPanel(ttk.Frame):
             self.ping_worker_spinbox,
             self.max_active_ping_spinbox,
             self.ping_retry_spinbox,
-            self.inventory_worker_spinbox,
             self.clear_button,
             self.export_button,
         )
@@ -4458,16 +4572,6 @@ class ScanControlPanel(ttk.Frame):
             width=4,
         )
         self.ping_retry_spinbox.pack(side="left", padx=(5, 12))
-
-        ttk.Label(options_frame, text="Inventory Workers:").pack(side="left")
-        self.inventory_worker_spinbox = ttk.Spinbox(
-            options_frame,
-            from_=AppConfig.MIN_INVENTORY_WORKERS,
-            to=AppConfig.MAX_INVENTORY_WORKERS,
-            textvariable=self.inventory_workers_var,
-            width=6,
-        )
-        self.inventory_worker_spinbox.pack(side="left", padx=(5, 12))
 
         button_frame = ttk.Frame(self)
         button_frame.grid(row=2, column=0, sticky="w", pady=(8, 0))
@@ -9464,6 +9568,7 @@ class MainApplication(tk.Tk):
                 database_manager=self.database_manager,
                 result_queue=self.result_queue,
                 credential_manager=self.credential_manager,
+                preferences_manager=self.preferences_manager,
             )
 
         except Exception as exc:
