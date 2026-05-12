@@ -1248,6 +1248,7 @@ class DatabaseManager:
                 scan_id INTEGER,
                 hostname TEXT,
                 ip_address TEXT,
+                ip_sort_key TEXT,
                 fqdn TEXT,
                 domain TEXT,
                 pingable INTEGER,
@@ -1295,6 +1296,9 @@ class DatabaseManager:
             CREATE INDEX IF NOT EXISTS idx_computers_scan_status
                 ON computers(scan_id, inventory_status, computer_id);
 
+            CREATE INDEX IF NOT EXISTS idx_computers_scan_ip_sort
+                ON computers(scan_id, ip_sort_key, hostname);
+
             CREATE INDEX IF NOT EXISTS idx_software_scan_identity
                 ON software(scan_id, display_name, display_version, publisher);
 
@@ -1317,6 +1321,16 @@ class DatabaseManager:
                     LOWER(TRIM(display_name)),
                     LOWER(TRIM(publisher))
                 );
+            """)
+            cursor.execute("PRAGMA table_info(computers)")
+            computer_columns = {row[1] for row in cursor.fetchall()}
+
+            if "ip_sort_key" not in computer_columns:
+                cursor.execute("ALTER TABLE computers ADD COLUMN ip_sort_key TEXT")
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_computers_scan_ip_sort
+                    ON computers(scan_id, ip_sort_key, hostname)
             """)
             self.connection.commit()
             AppLogger.log_message("info", "Database initialized.")
@@ -1461,6 +1475,13 @@ class DatabaseManager:
                     ON selected_computers.computer_id = c.computer_id
                 WHERE c.scan_id = ?
                     AND LOWER(TRIM(c.inventory_status)) IN (?, ?)
+                ORDER BY
+                    CASE
+                        WHEN selected_computers.computer_id IS NULL THEN 1
+                        ELSE 0
+                    END,
+                    c.ip_sort_key,
+                    LOWER(TRIM(c.hostname))
             """, (
                 scan_id,
                 display_name,
@@ -1475,13 +1496,14 @@ class DatabaseManager:
             ))
 
             rows = [dict(row) for row in cursor.fetchall()]
-            rows.sort(
-                key=lambda row: (
-                    0 if row.get("installed") == "Yes" else 1,
-                    self._ip_sort_key(row.get("ip_address", "")),
-                    str(row.get("hostname", "")).lower(),
+            if any(not row.get("ip_sort_key") for row in rows):
+                rows.sort(
+                    key=lambda row: (
+                        0 if row.get("installed") == "Yes" else 1,
+                        self._ip_sort_key(row.get("ip_address", "")),
+                        str(row.get("hostname", "")).lower(),
+                    )
                 )
-            )
             return rows
 
         except sqlite3.Error as exc:
@@ -1497,15 +1519,16 @@ class DatabaseManager:
             cursor = self.connection.cursor()
             cursor.execute("""
                 INSERT INTO computers (
-                    scan_id, hostname, ip_address, fqdn, domain,
+                    scan_id, hostname, ip_address, ip_sort_key, fqdn, domain,
                     pingable, matched_filter, inventory_status,
                     inventory_error, operating_system, manufacturer,
                     model, serial_number, last_seen
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.scan_id,
                 record.hostname,
                 record.ip_address,
+                self._ip_sort_db_key(record.ip_address),
                 record.fqdn,
                 record.domain,
                 int(record.pingable),
@@ -1608,8 +1631,8 @@ class DatabaseManager:
         """
         Return all computers with software counts.
 
-        IP sorting is performed in Python because SQLite has no built-in reverse
-        function and text sorting misorders IP addresses.
+        SQL ordering uses precomputed indexed keys; Python fallback is only
+        used for legacy rows missing the key.
         """
         try:
             cursor = self.connection.cursor()
@@ -1619,15 +1642,17 @@ class DatabaseManager:
                 LEFT JOIN software s ON c.computer_id = s.computer_id
                 WHERE c.scan_id = ?
                 GROUP BY c.computer_id
+                ORDER BY c.ip_sort_key, LOWER(TRIM(c.hostname))
             """, (scan_id,))
 
             rows = [dict(row) for row in cursor.fetchall()]
-            rows.sort(
-                key=lambda row: (
-                    self._ip_sort_key(row.get("ip_address", "")),
-                    str(row.get("hostname", "")).lower(),
+            if any(not row.get("ip_sort_key") for row in rows):
+                rows.sort(
+                    key=lambda row: (
+                        self._ip_sort_key(row.get("ip_address", "")),
+                        str(row.get("hostname", "")).lower(),
+                    )
                 )
-            )
             return rows
         except sqlite3.Error as exc:
             AppLogger.log_message("error", f"Computer count query failed: {exc}")
@@ -1658,6 +1683,7 @@ class DatabaseManager:
                         OR LOWER(TRIM(selected_s.publisher))=LOWER(TRIM(?))
                     )
                 GROUP BY c.computer_id
+                ORDER BY c.ip_sort_key, LOWER(TRIM(c.hostname))
             """, (
                 scan_id,
                 display_name,
@@ -1667,12 +1693,13 @@ class DatabaseManager:
             ))
 
             rows = [dict(row) for row in cursor.fetchall()]
-            rows.sort(
-                key=lambda row: (
-                    self._ip_sort_key(row.get("ip_address", "")),
-                    str(row.get("hostname", "")).lower(),
+            if any(not row.get("ip_sort_key") for row in rows):
+                rows.sort(
+                    key=lambda row: (
+                        self._ip_sort_key(row.get("ip_address", "")),
+                        str(row.get("hostname", "")).lower(),
+                    )
                 )
-            )
             return rows
         except sqlite3.Error as exc:
             AppLogger.log_message("error", f"Computers for software query failed: {exc}")
@@ -1766,6 +1793,24 @@ class DatabaseManager:
             return 0, int(ipaddress.ip_address(text)), text
         except ValueError:
             return 1, 0, text.lower()
+
+    def _ip_sort_db_key(self, value: Any) -> str:
+        """
+        Build indexed SQL sort key matching _ip_sort_key ordering semantics.
+
+        Args:
+            value: Raw IP address.
+
+        Returns:
+            Prefixed sortable key for SQLite ORDER BY operations.
+        """
+        text = str(value or "").strip()
+
+        try:
+            numeric_value = int(ipaddress.ip_address(text))
+            return f"0:{numeric_value:039d}:{text}"
+        except ValueError:
+            return f"1:{text.lower()}"
 
 # ------------------ IP Range Scanner ------------------ #
 class IpRangeScanner:
