@@ -1271,6 +1271,9 @@ class DatabaseManager:
                 display_name TEXT,
                 display_version TEXT,
                 publisher TEXT,
+                display_name_norm TEXT,
+                display_version_norm TEXT,
+                publisher_norm TEXT,
                 install_date TEXT,
                 uninstall_string TEXT,
                 install_location TEXT,
@@ -1307,21 +1310,29 @@ class DatabaseManager:
             CREATE INDEX IF NOT EXISTS idx_software_scan_computer
                 ON software(scan_id, computer_id);
 
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_software_computer_identity_norm
+                ON software(
+                    computer_id,
+                    display_name_norm,
+                    display_version_norm,
+                    publisher_norm
+                );
+
             CREATE INDEX IF NOT EXISTS idx_software_lookup_exact_norm
                 ON software(
                     scan_id,
                     computer_id,
-                    LOWER(TRIM(display_name)),
-                    LOWER(TRIM(display_version)),
-                    LOWER(TRIM(publisher))
+                    display_name_norm,
+                    display_version_norm,
+                    publisher_norm
                 );
 
             CREATE INDEX IF NOT EXISTS idx_software_lookup_group_norm
                 ON software(
                     scan_id,
                     computer_id,
-                    LOWER(TRIM(display_name)),
-                    LOWER(TRIM(publisher))
+                    display_name_norm,
+                    publisher_norm
                 );
             """)
             self.connection.commit()
@@ -1331,9 +1342,63 @@ class DatabaseManager:
             if "ip_sort_key" not in computer_columns:
                 cursor.execute("ALTER TABLE computers ADD COLUMN ip_sort_key TEXT")
 
+            cursor.execute("PRAGMA table_info(software)")
+            software_columns = {row[1] for row in cursor.fetchall()}
+            if "display_name_norm" not in software_columns:
+                cursor.execute(
+                    "ALTER TABLE software ADD COLUMN display_name_norm TEXT"
+                )
+            if "display_version_norm" not in software_columns:
+                cursor.execute(
+                    "ALTER TABLE software ADD COLUMN display_version_norm TEXT"
+                )
+            if "publisher_norm" not in software_columns:
+                cursor.execute(
+                    "ALTER TABLE software ADD COLUMN publisher_norm TEXT"
+                )
+
+            cursor.execute("""
+                UPDATE software
+                SET
+                    display_name_norm = LOWER(TRIM(COALESCE(display_name, ''))),
+                    display_version_norm = LOWER(TRIM(COALESCE(display_version, ''))),
+                    publisher_norm = LOWER(TRIM(COALESCE(publisher, '')))
+                WHERE display_name_norm IS NULL
+                    OR display_version_norm IS NULL
+                    OR publisher_norm IS NULL
+            """)
+
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_computers_scan_ip_sort
                     ON computers(scan_id, ip_sort_key, hostname)
+            """)
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_software_computer_identity_norm
+                    ON software(
+                        computer_id,
+                        display_name_norm,
+                        display_version_norm,
+                        publisher_norm
+                    )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_software_lookup_exact_norm
+                    ON software(
+                        scan_id,
+                        computer_id,
+                        display_name_norm,
+                        display_version_norm,
+                        publisher_norm
+                    )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_software_lookup_group_norm
+                    ON software(
+                        scan_id,
+                        computer_id,
+                        display_name_norm,
+                        publisher_norm
+                    )
             """)
             self.connection.commit()
             AppLogger.log_message("info", "Database initialized.")
@@ -1621,30 +1686,26 @@ class DatabaseManager:
         """
         try:
             cursor = self.connection.cursor()
-            seen_keys = set()
             rows = []
 
             for record in software_records:
                 if not record.is_valid():
                     continue
 
-                key = (
-                    computer_id,
-                    self._normalize_identity(record.display_name),
-                    self._normalize_identity(record.display_version),
-                    self._normalize_identity(record.publisher),
+                display_name_norm = self._normalize_identity(record.display_name)
+                display_version_norm = self._normalize_identity(
+                    record.display_version
                 )
-
-                if key in seen_keys:
-                    continue
-
-                seen_keys.add(key)
+                publisher_norm = self._normalize_identity(record.publisher)
                 rows.append((
                     record.scan_id,
                     computer_id,
                     record.display_name,
                     record.display_version,
                     record.publisher,
+                    display_name_norm,
+                    display_version_norm,
+                    publisher_norm,
                     record.install_date,
                     record.uninstall_string,
                     record.install_location,
@@ -1656,12 +1717,13 @@ class DatabaseManager:
                 ))
 
             cursor.executemany("""
-                INSERT INTO software (
+                INSERT OR IGNORE INTO software (
                     scan_id, computer_id, display_name, display_version,
-                    publisher, install_date, uninstall_string,
+                    publisher, display_name_norm, display_version_norm,
+                    publisher_norm, install_date, uninstall_string,
                     install_location, estimated_size, registry_key,
                     registry_hive, architecture, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, rows)
 
             self.connection.commit()
@@ -6830,6 +6892,9 @@ class LogsPanel(ttk.Frame):
         super().__init__(parent, padding=10)
 
         self.log_queue = log_queue
+        self.level_var = tk.StringVar(value="INFO+")
+        self.auto_scroll_var = tk.BooleanVar(value=True)
+        self._records: List[str] = []
         self._create_widgets()
 
     def append_log(self, text: str) -> None:
@@ -6842,11 +6907,16 @@ class LogsPanel(ttk.Frame):
         if not text:
             return
 
+        self._records.append(text.rstrip())
+        if not self._passes_level_filter(text):
+            return
+
         self.text.configure(state="normal")
         self.text.insert("end", text.rstrip() + "\n")
         self._apply_color(text)
         self.text.configure(state="disabled")
-        self.text.see("end")
+        if self.auto_scroll_var.get():
+            self.text.see("end")
 
     def process_log_queue(self) -> None:
         """
@@ -6863,6 +6933,7 @@ class LogsPanel(ttk.Frame):
 
     def clear_logs(self) -> None:
         """Clear log display."""
+        self._records.clear()
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.configure(state="disabled")
@@ -6894,11 +6965,67 @@ class LogsPanel(ttk.Frame):
             tag = "warning"
         elif "info" in lowered:
             tag = "info"
+        elif "debug" in lowered:
+            tag = "debug"
 
         if tag:
             start_index = self.text.index("end-2l")
             end_index = self.text.index("end-1l")
             self.text.tag_add(tag, start_index, end_index)
+
+    def _passes_level_filter(self, text: str) -> bool:
+        """
+        Check whether a log message should be displayed for current filter.
+
+        Args:
+            text: Full log message line.
+        """
+        selected = self.level_var.get()
+        lowered = text.lower()
+        level_order = {
+            "DEBUG": 10,
+            "INFO": 20,
+            "WARNING": 30,
+            "ERROR": 40,
+            "CRITICAL": 50,
+        }
+        selected_threshold = {
+            "DEBUG+": "DEBUG",
+            "INFO+": "INFO",
+            "WARNING+": "WARNING",
+            "ERROR+": "ERROR",
+            "CRITICAL": "CRITICAL",
+        }.get(selected, "INFO")
+
+        record_level_name = "INFO"
+        for candidate in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"):
+            if candidate.lower() in lowered:
+                record_level_name = candidate
+                break
+
+        return (
+            level_order[record_level_name]
+            >= level_order[selected_threshold]
+        )
+
+    def _refresh_visible_logs(self) -> None:
+        """Rebuild text area from cached records using current filter."""
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+
+        for record in self._records:
+            if not self._passes_level_filter(record):
+                continue
+            self.text.insert("end", record + "\n")
+            self._apply_color(record)
+
+        self.text.configure(state="disabled")
+        if self.auto_scroll_var.get():
+            self.text.see("end")
+
+    def _on_level_changed(self, _event: Optional[tk.Event] = None) -> None:
+        """Handle user log-level dropdown changes."""
+        self._refresh_visible_logs()
 
     def _create_widgets(self) -> None:
         """Create logs panel layout."""
@@ -6928,6 +7055,28 @@ class LogsPanel(ttk.Frame):
         )
         self.copy_button.pack(side="left")
 
+        ttk.Label(
+            control_frame,
+            text="Level:",
+        ).pack(side="left", padx=(12, 4))
+
+        self.level_combobox = ttk.Combobox(
+            control_frame,
+            textvariable=self.level_var,
+            values=("DEBUG+", "INFO+", "WARNING+", "ERROR+", "CRITICAL"),
+            state="readonly",
+            width=10,
+        )
+        self.level_combobox.pack(side="left")
+        self.level_combobox.bind("<<ComboboxSelected>>", self._on_level_changed)
+
+        self.auto_scroll_check = ttk.Checkbutton(
+            control_frame,
+            text="Auto-scroll",
+            variable=self.auto_scroll_var,
+        )
+        self.auto_scroll_check.pack(side="left", padx=(12, 0))
+
         text_frame = ttk.Frame(self)
         text_frame.pack(fill="both", expand=True)
 
@@ -6953,6 +7102,7 @@ class LogsPanel(ttk.Frame):
         self.text.tag_configure("error", foreground="red")
         self.text.tag_configure("warning", foreground="orange")
         self.text.tag_configure("info", foreground="black")
+        self.text.tag_configure("debug", foreground="#5C6370")
     
 # ------------------ Status Bar ------------------ #
 class StatusBar(ttk.Frame):
