@@ -1312,33 +1312,6 @@ class DatabaseManager:
             CREATE INDEX IF NOT EXISTS idx_software_scan_computer
                 ON software(scan_id, computer_id);
 
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_software_computer_identity_norm
-                ON software(
-                    scan_id,
-                    computer_id,
-                    display_name_norm,
-                    display_version_norm,
-                    publisher_norm,
-                    architecture,
-                    registry_key
-                );
-
-            CREATE INDEX IF NOT EXISTS idx_software_lookup_exact_norm
-                ON software(
-                    scan_id,
-                    computer_id,
-                    display_name_norm,
-                    display_version_norm,
-                    publisher_norm
-                );
-
-            CREATE INDEX IF NOT EXISTS idx_software_lookup_group_norm
-                ON software(
-                    scan_id,
-                    computer_id,
-                    display_name_norm,
-                    publisher_norm
-                );
             """)
             self.connection.commit()
             cursor.execute("PRAGMA table_info(computers)")
