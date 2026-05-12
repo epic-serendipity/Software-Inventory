@@ -1127,6 +1127,8 @@ class SoftwareRecord:
     architecture: str = ""
     raw_json: str = ""
     scan_id: Optional[int] = None
+    phase1_failed: bool = False
+    phase2_failed: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -1312,10 +1314,13 @@ class DatabaseManager:
 
             CREATE UNIQUE INDEX IF NOT EXISTS uq_software_computer_identity_norm
                 ON software(
+                    scan_id,
                     computer_id,
                     display_name_norm,
                     display_version_norm,
-                    publisher_norm
+                    publisher_norm,
+                    architecture,
+                    registry_key
                 );
 
             CREATE INDEX IF NOT EXISTS idx_software_lookup_exact_norm
@@ -1373,14 +1378,19 @@ class DatabaseManager:
                     ON computers(scan_id, ip_sort_key, hostname)
             """)
             cursor.execute("""
+                DROP INDEX IF EXISTS uq_software_computer_identity_norm;
+
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_software_computer_identity_norm
                     ON software(
+                        scan_id,
                         computer_id,
                         display_name_norm,
                         display_version_norm,
-                        publisher_norm
+                        publisher_norm,
+                        architecture,
+                        registry_key
                     )
-            """)
+                """)
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_software_lookup_exact_norm
                     ON software(
@@ -1802,16 +1812,31 @@ class DatabaseManager:
                 ))
 
             cursor.executemany("""
-                INSERT OR IGNORE INTO software (
+                INSERT INTO software (
                     scan_id, computer_id, display_name, display_version,
                     publisher, display_name_norm, display_version_norm,
                     publisher_norm, install_date, uninstall_string,
                     install_location, estimated_size, registry_key,
                     registry_hive, architecture, raw_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    scan_id,
+                    computer_id,
+                    display_name_norm,
+                    display_version_norm,
+                    publisher_norm,
+                    architecture,
+                    registry_key
+                ) DO UPDATE SET
+                    install_date=COALESCE(NULLIF(excluded.install_date, ''), software.install_date),
+                    uninstall_string=COALESCE(NULLIF(excluded.uninstall_string, ''), software.uninstall_string),
+                    install_location=COALESCE(NULLIF(excluded.install_location, ''), software.install_location),
+                    estimated_size=COALESCE(NULLIF(excluded.estimated_size, ''), software.estimated_size),
+                    raw_json=COALESCE(NULLIF(excluded.raw_json, ''), software.raw_json)
             """, rows)
 
-            self.connection.commit()
+            if commit:
+                self.connection.commit()
         except sqlite3.Error as exc:
             AppLogger.log_message("error", f"Insert software failed: {exc}")
 
@@ -2528,22 +2553,15 @@ class RegistryInventoryScanner:
             )
 
         try:
-            command = self.build_registry_command(target)
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                check=False,
-            )
+            completed_phase1 = self._run_inventory_phase(target, phase="phase1")
 
             duration = time.perf_counter() - started
             completed_at = datetime.now().strftime(
                 AppConfig.STORAGE_TIMESTAMP_FORMAT
             )
 
-            if completed.returncode != 0:
-                error_text = completed.stderr.strip() or completed.stdout.strip()
+            if completed_phase1.returncode != 0:
+                error_text = completed_phase1.stderr.strip() or completed_phase1.stdout.strip()
                 friendly_error = self.classify_error(error_text)
                 computer_record.mark_inventory_failure(friendly_error)
 
@@ -2559,9 +2577,23 @@ class RegistryInventoryScanner:
                 )
 
             software_records, telemetry = self.parse_software_json(
-                completed.stdout,
+                completed_phase1.stdout,
                 computer_record,
             )
+            phase2_error = ""
+            completed_phase2 = self._run_inventory_phase(target, phase="phase2")
+            if completed_phase2.returncode == 0:
+                phase2_records, _ = self.parse_software_json(
+                    completed_phase2.stdout,
+                    computer_record,
+                )
+                self._merge_optional_fields(software_records, phase2_records)
+            else:
+                phase2_error = self.classify_error(
+                    completed_phase2.stderr.strip() or completed_phase2.stdout.strip()
+                )
+                for item in software_records:
+                    item.phase2_failed = True
             if telemetry:
                 AppLogger.log_message(
                     "debug",
@@ -2571,7 +2603,10 @@ class RegistryInventoryScanner:
                         f"query_ms={telemetry.get('query_ms', 0.0):.2f}"
                     ),
                 )
-            computer_record.mark_inventory_success()
+            if software_records and phase2_error:
+                computer_record.mark_inventory_partial(f"Phase 2 failed: {phase2_error}")
+            else:
+                computer_record.mark_inventory_success()
 
             return computer_record, software_records, ScanResult(
                 task_name="Inventory",
@@ -2625,6 +2660,16 @@ class RegistryInventoryScanner:
                 ),
                 duration_seconds=duration,
             )
+
+    def _run_inventory_phase(self, hostname: str, phase: str) -> subprocess.CompletedProcess:
+        command = self.build_registry_command(hostname, phase=phase)
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+            check=False,
+        )
 
     def inventory_many(
         self,
@@ -2690,7 +2735,7 @@ class RegistryInventoryScanner:
 
         return inventory_results
 
-    def build_registry_command(self, hostname: str) -> List[str]:
+    def build_registry_command(self, hostname: str, phase: str = "phase1") -> List[str]:
         """
         Build a PowerShell registry inventory command.
         """
@@ -2699,6 +2744,16 @@ class RegistryInventoryScanner:
             f"'{path}'" for path in AppConfig.REGISTRY_UNINSTALL_PATHS
         )
 
+        identity_select = (
+            "Select-Object DisplayName, DisplayVersion, Publisher, "
+            "PSChildName, PSPath"
+        )
+        detail_select = (
+            "Select-Object DisplayName, DisplayVersion, Publisher, "
+            "InstallDate, UninstallString, InstallLocation, EstimatedSize, "
+            "PSChildName, PSPath"
+        )
+        selected_columns = identity_select if phase == "phase1" else detail_select
         query_script = (
             "$paths = @("
             f"{registry_paths}"
@@ -2707,9 +2762,7 @@ class RegistryInventoryScanner:
             "Get-ItemProperty -Path $path -ErrorAction SilentlyContinue "
             "}; "
             "$items | Where-Object { $_.DisplayName } | "
-            "Select-Object DisplayName, DisplayVersion, Publisher, "
-            "InstallDate, UninstallString, InstallLocation, EstimatedSize, "
-            "PSChildName, PSPath"
+            f"{selected_columns}"
         )
 
         credential_argument = self.credential_manager.build_credential_argument()
@@ -2748,6 +2801,38 @@ class RegistryInventoryScanner:
             "-Command",
             command,
         ]
+
+    def _merge_optional_fields(
+        self,
+        base_records: List[SoftwareRecord],
+        detail_records: List[SoftwareRecord],
+    ) -> None:
+        detail_map: Dict[Tuple[str, str, str, str, str], SoftwareRecord] = {}
+        for item in detail_records:
+            key = (
+                (item.display_name or "").strip().lower(),
+                (item.display_version or "").strip().lower(),
+                (item.publisher or "").strip().lower(),
+                (item.architecture or "").strip().lower(),
+                (item.registry_key or "").strip().lower(),
+            )
+            detail_map[key] = item
+        for item in base_records:
+            key = (
+                (item.display_name or "").strip().lower(),
+                (item.display_version or "").strip().lower(),
+                (item.publisher or "").strip().lower(),
+                (item.architecture or "").strip().lower(),
+                (item.registry_key or "").strip().lower(),
+            )
+            detail = detail_map.get(key)
+            if not detail:
+                item.phase2_failed = True
+                continue
+            item.install_date = detail.install_date
+            item.uninstall_string = detail.uninstall_string
+            item.install_location = detail.install_location
+            item.estimated_size = detail.estimated_size
 
     def parse_software_json(
         self,
